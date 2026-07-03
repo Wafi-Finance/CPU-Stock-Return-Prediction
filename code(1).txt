@@ -1,0 +1,475 @@
+# ================================================================
+# ARIMA–LSTM Hybrid Crisis + Full Period Evaluation Framework
+# Metrics: RMSE, MAE, R² + DM + Clark–McCracken Tests
+# ================================================================
+
+import numpy as np
+import pandas as pd
+import warnings
+warnings.filterwarnings("ignore")
+
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.linear_model import LinearRegression
+
+from statsmodels.tsa.arima.model import ARIMA
+from scipy.stats import norm
+
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+
+# ================================================================
+# 1. Crisis periods
+# ================================================================
+CRISIS_PERIODS = {
+    "DotCom": ("2000-03-24", "2002-10-09"),
+    "GFC": ("2007-12-01", "2009-06-30"),
+    "EuroDebt": ("2010-04-01", "2012-07-31"),
+    "OilCollapse": ("2015-06-01", "2016-06-30"),
+    "COVID": ("2020-02-01", "2020-12-31"),
+    "InflationTightening": ("2022-01-01", "2022-12-31"),
+    "RussiaUkraine": ("2022-02-24", "2022-12-31"),
+    "IsraelPalestine": ("2023-10-01", "2024-03-31"),
+}
+
+# ================================================================
+# 2. Feature Engineering
+# ================================================================
+def calculate_rsi(series, period=14):
+    delta = series.diff()
+    gain = np.where(delta > 0, delta, 0.0)
+    loss = np.where(delta < 0, -delta, 0.0)
+    roll_up = pd.Series(gain).rolling(period).mean()
+    roll_down = pd.Series(loss).rolling(period).mean()
+    rs = roll_up / roll_down
+    return (100 - (100 / (1 + rs))).values
+
+def calculate_bollinger_bands(series, window=20):
+    mean = series.rolling(window).mean()
+    std = series.rolling(window).std()
+    width = (2 * std) / mean
+    return width.values
+
+def calculate_macd(series):
+    ema12 = series.ewm(span=12).mean()
+    ema26 = series.ewm(span=26).mean()
+    macd = ema12 - ema26
+    return macd.values
+
+def add_features(df):
+    temp = df['Close'] if 'Close' in df.columns else df['Daily Log Return']
+
+    df['MA_10'] = temp.rolling(10).mean()
+    df['RSI_14'] = calculate_rsi(temp)
+    df['BB_Width'] = calculate_bollinger_bands(temp)
+    df['MACD'] = calculate_macd(temp)
+
+    if 'Daily Log Return' not in df.columns:
+        df['Daily Log Return'] = np.log(df['Close'] / df['Close'].shift(1))
+
+    required = [
+        '(SMB) Small-Minus-Big Return',
+        '(HML) High-Minus-Low Return',
+        '(RMW) Robust Minus Weak Return',
+        '(CMA) Conservative Minus Aggressive Return',
+        '(MOM) Momentum',
+        'Amihud LIQ',
+        'Adjusted_CPU_Daily'
+    ]
+
+    for col in required:
+        if col not in df.columns:
+            raise ValueError(f"Missing column: {col}")
+
+    df.dropna(inplace=True)
+    return df
+
+def add_crisis_dummy(df):
+    df['Crisis_Dummy'] = 0
+    for s, e in CRISIS_PERIODS.values():
+        df.loc[s:e, 'Crisis_Dummy'] = 1
+    return df
+
+# ================================================================
+# 3. LSTM Utilities
+# ================================================================
+def make_lstm_dataset(y, X, seq_len=30):
+    X_out, y_out = [], []
+    for i in range(seq_len, len(y)):
+        X_out.append(np.column_stack([y[i-seq_len:i], X[i-seq_len:i]]))
+        y_out.append(y[i])
+    return np.array(X_out), np.array(y_out)
+
+def build_lstm(input_shape):
+    model = Sequential([
+        LSTM(64, input_shape=input_shape),
+        Dropout(0.2),
+        Dense(1)
+    ])
+    model.compile(optimizer='adam', loss='mse')
+    return model
+
+# ================================================================
+# 4. Statistical Tests
+# ================================================================
+def diebold_mariano_test(e1, e2):
+    d = e1**2 - e2**2
+    stat = np.mean(d) / np.sqrt(np.var(d, ddof=1) / len(d))
+    p = 2 * (1 - norm.cdf(abs(stat)))
+    return stat, p
+
+def mse_f_test(e_r, e_u):
+    T = len(e_r)
+    return T * (np.mean(e_r**2) - np.mean(e_u**2)) / np.mean(e_u**2)
+
+def enc_new_test(y, f_r, f_u):
+    e_r = y - f_r
+    e_u = y - f_u
+    d = e_r * (e_r - e_u)
+    return np.mean(d) / np.sqrt(np.var(d, ddof=1) / len(d))
+
+# ================================================================
+# 5. Crisis Evaluation
+# ================================================================
+def evaluate_crises(df, target, features):
+    results = []
+    all_predictions = {}  # Store predictions for each crisis
+
+    for name, (start, end) in CRISIS_PERIODS.items():
+        start, end = pd.to_datetime(start), pd.to_datetime(end)
+
+        train = df[df.index < start]
+        test = df[(df.index >= start) & (df.index <= end)]
+
+        if len(train) < 500 or len(test) < 30:
+            continue
+
+        f = features + ['Crisis_Dummy']
+
+        # ARIMA
+        arima = ARIMA(train[target], exog=train[f], order=(5,1,0)).fit()
+        arima_pred = arima.forecast(len(test), exog=test[f])
+
+        # LSTM
+        sy, sx = MinMaxScaler(), MinMaxScaler()
+        y_scaled = sy.fit_transform(train[[target]])
+        x_scaled = sx.fit_transform(train[f])
+
+        X_train, y_train = make_lstm_dataset(y_scaled, x_scaled)
+        lstm = build_lstm(X_train.shape[1:])
+        lstm.fit(X_train, y_train, epochs=30, verbose=0)
+
+        X_all, _ = make_lstm_dataset(
+            sy.transform(df[[target]]),
+            sx.transform(df[f])
+        )
+
+        lstm_pred = sy.inverse_transform(
+            lstm.predict(X_all[-len(test):], verbose=0)
+        )
+
+        # Hybrid
+        hybrid_X = np.column_stack([arima_pred, lstm_pred.flatten()])
+        hybrid = LinearRegression().fit(hybrid_X, test[target])
+        hybrid_pred = hybrid.predict(hybrid_X)
+
+        # Calculate all metrics
+        y_true = test[target].values
+        
+        # RMSE
+        rmse_arima = np.sqrt(mean_squared_error(y_true, arima_pred))
+        rmse_lstm = np.sqrt(mean_squared_error(y_true, lstm_pred.flatten()))
+        rmse_hybrid = np.sqrt(mean_squared_error(y_true, hybrid_pred))
+        
+        # MAE
+        mae_arima = mean_absolute_error(y_true, arima_pred)
+        mae_lstm = mean_absolute_error(y_true, lstm_pred.flatten())
+        mae_hybrid = mean_absolute_error(y_true, hybrid_pred)
+        
+        # R²
+        r2_arima = r2_score(y_true, arima_pred)
+        r2_lstm = r2_score(y_true, lstm_pred.flatten())
+        r2_hybrid = r2_score(y_true, hybrid_pred)
+        
+        # Errors for statistical tests
+        e_a = y_true - arima_pred
+        e_l = y_true - lstm_pred.flatten()
+        e_h = y_true - hybrid_pred
+        
+        # DM tests (ARIMA vs Hybrid, LSTM vs Hybrid)
+        dm_arima_hybrid, p_arima_hybrid = diebold_mariano_test(e_a, e_h)
+        dm_lstm_hybrid, p_lstm_hybrid = diebold_mariano_test(e_l, e_h)
+        
+        # MSE-F tests
+        mse_f_arima = mse_f_test(e_a, e_h)
+        mse_f_lstm = mse_f_test(e_l, e_h)
+        
+        # ENC-NEW tests
+        enc_new_arima = enc_new_test(y_true, arima_pred, hybrid_pred)
+        enc_new_lstm = enc_new_test(y_true, lstm_pred.flatten(), hybrid_pred)
+        
+        results.append({
+            "Crisis": name,
+            "Start": start.strftime('%Y-%m-%d'),
+            "End": end.strftime('%Y-%m-%d'),
+            "Observations": len(test),
+            
+            # ARIMA metrics
+            "ARIMA_RMSE": rmse_arima,
+            "ARIMA_MAE": mae_arima,
+            "ARIMA_R2": r2_arima,
+            
+            # LSTM metrics
+            "LSTM_RMSE": rmse_lstm,
+            "LSTM_MAE": mae_lstm,
+            "LSTM_R2": r2_lstm,
+            
+            # Hybrid metrics
+            "Hybrid_RMSE": rmse_hybrid,
+            "Hybrid_MAE": mae_hybrid,
+            "Hybrid_R2": r2_hybrid,
+            
+            # DM tests
+            "DM_ARIMA_vs_Hybrid": dm_arima_hybrid,
+            "DM_p_ARIMA_vs_Hybrid": p_arima_hybrid,
+            "DM_LSTM_vs_Hybrid": dm_lstm_hybrid,
+            "DM_p_LSTM_vs_Hybrid": p_lstm_hybrid,
+            
+            # MSE-F tests
+            "MSE-F_ARIMA_vs_Hybrid": mse_f_arima,
+            "MSE-F_LSTM_vs_Hybrid": mse_f_lstm,
+            
+            # ENC-NEW tests
+            "ENC-NEW_ARIMA_vs_Hybrid": enc_new_arima,
+            "ENC-NEW_LSTM_vs_Hybrid": enc_new_lstm,
+            
+            # Percentage improvements
+            "ARIMA_vs_Hybrid_Improvement_%": ((rmse_arima - rmse_hybrid) / rmse_arima) * 100,
+            "LSTM_vs_Hybrid_Improvement_%": ((rmse_lstm - rmse_hybrid) / rmse_lstm) * 100
+        })
+        
+        # Store predictions for potential additional analysis
+        all_predictions[name] = {
+            "y_true": y_true,
+            "arima_pred": arima_pred,
+            "lstm_pred": lstm_pred.flatten(),
+            "hybrid_pred": hybrid_pred
+        }
+
+    return pd.DataFrame(results), all_predictions
+
+# ================================================================
+# 6. Full Period Evaluation
+# ================================================================
+def evaluate_full(df, target, features):
+    split = int(len(df)*0.8)
+    train, test = df.iloc[:split], df.iloc[split:]
+
+    f = features + ['Crisis_Dummy']
+
+    # ARIMA
+    arima = ARIMA(train[target], exog=train[f], order=(5,1,0)).fit()
+    arima_pred = arima.forecast(len(test), exog=test[f])
+
+    # LSTM
+    sy, sx = MinMaxScaler(), MinMaxScaler()
+    y_scaled = sy.fit_transform(train[[target]])
+    x_scaled = sx.fit_transform(train[f])
+
+    X_train, y_train = make_lstm_dataset(y_scaled, x_scaled)
+    lstm = build_lstm(X_train.shape[1:])
+    lstm.fit(X_train, y_train, epochs=30, verbose=0)
+
+    X_all, _ = make_lstm_dataset(
+        sy.transform(df[[target]]),
+        sx.transform(df[f])
+    )
+
+    lstm_pred = sy.inverse_transform(
+        lstm.predict(X_all[-len(test):], verbose=0)
+    )
+
+    # Hybrid
+    hybrid_X = np.column_stack([arima_pred, lstm_pred.flatten()])
+    hybrid = LinearRegression().fit(hybrid_X, test[target])
+    hybrid_pred = hybrid.predict(hybrid_X)
+    
+    # Calculate metrics
+    y_true = test[target].values
+    
+    results = {
+        "ARIMA_RMSE": np.sqrt(mean_squared_error(y_true, arima_pred)),
+        "ARIMA_MAE": mean_absolute_error(y_true, arima_pred),
+        "ARIMA_R2": r2_score(y_true, arima_pred),
+        
+        "LSTM_RMSE": np.sqrt(mean_squared_error(y_true, lstm_pred.flatten())),
+        "LSTM_MAE": mean_absolute_error(y_true, lstm_pred.flatten()),
+        "LSTM_R2": r2_score(y_true, lstm_pred.flatten()),
+        
+        "Hybrid_RMSE": np.sqrt(mean_squared_error(y_true, hybrid_pred)),
+        "Hybrid_MAE": mean_absolute_error(y_true, hybrid_pred),
+        "Hybrid_R2": r2_score(y_true, hybrid_pred),
+        
+        "Observations": len(test),
+        "Training_Size": len(train),
+        "Testing_Size": len(test)
+    }
+    
+    # Calculate improvement percentages
+    results["ARIMA_vs_Hybrid_Improvement_%"] = ((results["ARIMA_RMSE"] - results["Hybrid_RMSE"]) / results["ARIMA_RMSE"]) * 100
+    results["LSTM_vs_Hybrid_Improvement_%"] = ((results["LSTM_RMSE"] - results["Hybrid_RMSE"]) / results["LSTM_RMSE"]) * 100
+    
+    # Statistical tests for full period
+    e_a = y_true - arima_pred
+    e_l = y_true - lstm_pred.flatten()
+    e_h = y_true - hybrid_pred
+    
+    dm_arima_hybrid, p_arima_hybrid = diebold_mariano_test(e_a, e_h)
+    dm_lstm_hybrid, p_lstm_hybrid = diebold_mariano_test(e_l, e_h)
+    
+    results["DM_ARIMA_vs_Hybrid"] = dm_arima_hybrid
+    results["DM_p_ARIMA_vs_Hybrid"] = p_arima_hybrid
+    results["DM_LSTM_vs_Hybrid"] = dm_lstm_hybrid
+    results["DM_p_LSTM_vs_Hybrid"] = p_lstm_hybrid
+    
+    results["MSE-F_ARIMA_vs_Hybrid"] = mse_f_test(e_a, e_h)
+    results["MSE-F_LSTM_vs_Hybrid"] = mse_f_test(e_l, e_h)
+    
+    results["ENC-NEW_ARIMA_vs_Hybrid"] = enc_new_test(y_true, arima_pred, hybrid_pred)
+    results["ENC-NEW_LSTM_vs_Hybrid"] = enc_new_test(y_true, lstm_pred.flatten(), hybrid_pred)
+    
+    return pd.DataFrame([results])
+
+# ================================================================
+# 7. Summary Statistics
+# ================================================================
+def generate_summary_stats(crisis_results_df, full_results_df):
+    """Generate summary statistics across all crises"""
+    
+    # Summary across crises
+    crisis_summary = crisis_results_df[["ARIMA_RMSE", "LSTM_RMSE", "Hybrid_RMSE", 
+                                        "ARIMA_MAE", "LSTM_MAE", "Hybrid_MAE",
+                                        "ARIMA_R2", "LSTM_R2", "Hybrid_R2"]].agg(['mean', 'std', 'min', 'max'])
+    
+    # Best performing model in each crisis (lowest RMSE)
+    crisis_results_df["Best_Model_RMSE"] = crisis_results_df[["ARIMA_RMSE", "LSTM_RMSE", "Hybrid_RMSE"]].idxmin(axis=1)
+    
+    # Count how many times each model is best
+    best_model_counts = crisis_results_df["Best_Model_RMSE"].value_counts()
+    
+    # Average improvement percentages
+    avg_improvements = crisis_results_df[["ARIMA_vs_Hybrid_Improvement_%", "LSTM_vs_Hybrid_Improvement_%"]].mean()
+    
+    return crisis_summary, best_model_counts, avg_improvements
+
+# ================================================================
+# 8. MAIN
+# ================================================================
+def main():
+    # Load data
+    df = pd.read_csv("sample.csv", parse_dates=["Date"], index_col="Date")
+
+    df = add_features(df)
+    df = add_crisis_dummy(df)
+
+    target = "Daily Log Return"
+
+    features = [
+        '(SMB) Small-Minus-Big Return',
+        '(HML) High-Minus-Low Return',
+        '(RMW) Robust Minus Weak Return',
+        '(CMA) Conservative Minus Aggressive Return',
+        'Adjusted_CPU_Daily',
+        '(MOM) Momentum',
+        'Amihud LIQ',
+        'MA_10','BB_Width','RSI_14','MACD'
+    ]
+
+    # Evaluate during crises
+    crisis_results, crisis_predictions = evaluate_crises(df, target, features)
+    
+    # Evaluate full period
+    full_results = evaluate_full(df, target, features)
+    
+    # Generate summary statistics
+    crisis_summary, best_model_counts, avg_improvements = generate_summary_stats(crisis_results, full_results)
+
+    # Print results
+    print("\n" + "="*80)
+    print("ARIMA-LSTM HYBRID MODEL EVALUATION FRAMEWORK")
+    print("="*80)
+    
+    print("\n===== FULL PERIOD PERFORMANCE =====")
+    print("-"*80)
+    print(full_results[["ARIMA_RMSE", "LSTM_RMSE", "Hybrid_RMSE", 
+                        "ARIMA_MAE", "LSTM_MAE", "Hybrid_MAE",
+                        "ARIMA_R2", "LSTM_R2", "Hybrid_R2"]].round(6).to_string(index=False))
+    print(f"\nTraining Observations: {full_results['Training_Size'].values[0]}")
+    print(f"Testing Observations: {full_results['Testing_Size'].values[0]}")
+    print(f"\nARIMA vs Hybrid Improvement: {full_results['ARIMA_vs_Hybrid_Improvement_%'].values[0]:.2f}%")
+    print(f"LSTM vs Hybrid Improvement: {full_results['LSTM_vs_Hybrid_Improvement_%'].values[0]:.2f}%")
+    
+    print("\n===== CRISIS PERIOD PERFORMANCE =====")
+    print("-"*80)
+    print(crisis_results[["Crisis", "Start", "End", "Observations",
+                         "ARIMA_RMSE", "LSTM_RMSE", "Hybrid_RMSE", 
+                         "ARIMA_R2", "LSTM_R2", "Hybrid_R2",
+                         "ARIMA_vs_Hybrid_Improvement_%", "LSTM_vs_Hybrid_Improvement_%"]].round(6).to_string(index=False))
+    
+    print("\n===== SUMMARY ACROSS ALL CRISES =====")
+    print("-"*80)
+    print("\nRMSE Summary Statistics:")
+    print(crisis_summary.round(6))
+    print("\nBest Model Counts (based on RMSE):")
+    print(best_model_counts)
+    print("\nAverage Improvement (%) across Crises:")
+    print(f"ARIMA vs Hybrid: {avg_improvements['ARIMA_vs_Hybrid_Improvement_%']:.2f}%")
+    print(f"LSTM vs Hybrid: {avg_improvements['LSTM_vs_Hybrid_Improvement_%']:.2f}%")
+    
+    print("\n===== STATISTICAL TESTS =====")
+    print("-"*80)
+    print("\nFull Period Statistical Tests:")
+    print(f"DM Test (ARIMA vs Hybrid): {full_results['DM_ARIMA_vs_Hybrid'].values[0]:.4f} (p={full_results['DM_p_ARIMA_vs_Hybrid'].values[0]:.4f})")
+    print(f"DM Test (LSTM vs Hybrid): {full_results['DM_LSTM_vs_Hybrid'].values[0]:.4f} (p={full_results['DM_p_LSTM_vs_Hybrid'].values[0]:.4f})")
+    print(f"MSE-F (ARIMA vs Hybrid): {full_results['MSE-F_ARIMA_vs_Hybrid'].values[0]:.4f}")
+    print(f"MSE-F (LSTM vs Hybrid): {full_results['MSE-F_LSTM_vs_Hybrid'].values[0]:.4f}")
+    print(f"ENC-NEW (ARIMA vs Hybrid): {full_results['ENC-NEW_ARIMA_vs_Hybrid'].values[0]:.4f}")
+    print(f"ENC-NEW (LSTM vs Hybrid): {full_results['ENC-NEW_LSTM_vs_Hybrid'].values[0]:.4f}")
+    
+    # Create a comprehensive performance summary table
+    print("\n===== COMPREHENSIVE PERFORMANCE SUMMARY =====")
+    print("-"*80)
+    
+    # Prepare summary for export
+    full_summary = full_results.copy()
+    full_summary["Period"] = "Full"
+    crisis_summary_df = crisis_results[["Crisis", "ARIMA_RMSE", "LSTM_RMSE", "Hybrid_RMSE", 
+                                        "ARIMA_MAE", "LSTM_MAE", "Hybrid_MAE",
+                                        "ARIMA_R2", "LSTM_R2", "Hybrid_R2",
+                                        "ARIMA_vs_Hybrid_Improvement_%", "LSTM_vs_Hybrid_Improvement_%"]].copy()
+    crisis_summary_df["Period"] = crisis_summary_df["Crisis"]
+    
+    # Combine full and crisis results
+    combined_summary = pd.concat([
+        full_summary[["Period", "ARIMA_RMSE", "LSTM_RMSE", "Hybrid_RMSE", 
+                     "ARIMA_MAE", "LSTM_MAE", "Hybrid_MAE",
+                     "ARIMA_R2", "LSTM_R2", "Hybrid_R2",
+                     "ARIMA_vs_Hybrid_Improvement_%", "LSTM_vs_Hybrid_Improvement_%"]],
+        crisis_summary_df
+    ], ignore_index=True)
+    
+    print(combined_summary.round(6).to_string(index=False))
+    
+    # Optionally save results to CSV
+    crisis_results.to_csv("crisis_performance_results.csv", index=False)
+    full_results.to_csv("full_period_results.csv", index=False)
+    combined_summary.to_csv("comprehensive_performance_summary.csv", index=False)
+    
+    print("\nResults saved to CSV files:")
+    print("- crisis_performance_results.csv")
+    print("- full_period_results.csv")
+    print("- comprehensive_performance_summary.csv")
+
+if __name__ == "__main__":
+    main()
