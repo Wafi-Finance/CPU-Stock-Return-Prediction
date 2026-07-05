@@ -57,7 +57,7 @@ Some datasets may be subject to licensing restrictions. Users should obtain data
 
 If you use this repository, please cite:
 
-Wafi, A.S., El-Halby, S., Albitar, K. (2026). *Climate Policy Uncertainty and Regime-Dependent Stock Return Predictability*. [Journal Name].
+Wafi, A.S., El-Halaby, S. and Albitar, K. (2026) ‘Stock return forecasting under climate policy uncertainty: A regime-dependent model comparison’, Finance Research Letters, article 110456. https://doi.org/10.1016/j.frl.2026.110456.
 
 ---
 
